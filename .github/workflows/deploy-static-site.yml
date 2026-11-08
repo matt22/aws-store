@@ -1,0 +1,88 @@
+name: Deploy static site
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: aws-store-static-site
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Provision and deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Deploy CloudFormation stack
+        run: >-
+          aws cloudformation deploy
+          --template-file infra/static-site.yaml
+          --stack-name aws-store-static
+          --parameter-overrides DistributionEnabled=true
+          --no-fail-on-empty-changeset
+
+      - name: Publish storefront to S3
+        id: publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          bucket="$(aws cloudformation describe-stacks \
+            --stack-name aws-store-static \
+            --query "Stacks[0].Outputs[?OutputKey=='SiteBucketName'].OutputValue | [0]" \
+            --output text)"
+          distribution="$(aws cloudformation describe-stacks \
+            --stack-name aws-store-static \
+            --query "Stacks[0].Outputs[?OutputKey=='DistributionId'].OutputValue | [0]" \
+            --output text)"
+
+          if [[ -z "$bucket" || "$bucket" == "None" || -z "$distribution" || "$distribution" == "None" ]]; then
+            echo "Could not read bucket or distribution outputs from CloudFormation." >&2
+            exit 1
+          fi
+
+          aws s3 sync . "s3://${bucket}/" \
+            --delete \
+            --exclude '.git/*' \
+            --exclude '.github/*' \
+            --exclude 'infra/*' \
+            --exclude 'README.md' \
+            --exclude '.gitignore'
+          invalidation="$(aws cloudfront create-invalidation \
+            --distribution-id "$distribution" \
+            --paths '/*' \
+            --query 'Invalidation.Id' \
+            --output text)"
+
+          echo "bucket=${bucket}" >> "$GITHUB_OUTPUT"
+          echo "distribution=${distribution}" >> "$GITHUB_OUTPUT"
+          echo "invalidation=${invalidation}" >> "$GITHUB_OUTPUT"
+
+      - name: Write deployment summary
+        env:
+          BUCKET: ${{ steps.publish.outputs.bucket }}
+          DISTRIBUTION: ${{ steps.publish.outputs.distribution }}
+          INVALIDATION: ${{ steps.publish.outputs.invalidation }}
+        run: |
+          site_url="$(aws cloudformation describe-stacks \
+            --stack-name aws-store-static \
+            --query "Stacks[0].Outputs[?OutputKey=='SiteURL'].OutputValue | [0]" \
+            --output text)"
+          {
+            echo "## Static site deployment"
+            echo "- Site: ${site_url}"
+            echo "- S3 bucket: ${BUCKET} (private)"
+            echo "- CloudFront distribution: ${DISTRIBUTION}"
+            echo "- Cache invalidation: ${INVALIDATION}"
+          } >> "$GITHUB_STEP_SUMMARY"
